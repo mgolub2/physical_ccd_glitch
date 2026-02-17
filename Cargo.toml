@@ -1,0 +1,13 @@
+[package]
+name = "physical_ccd_glitch"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+eframe = "0.31"
+egui_extras = { version = "0.31", features = ["image"] }
+image = "0.25"
+rfd = "0.15"
+rand = "0.9"
+rand_distr = "0.5"
+rayon = "1.10"
