@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+
+<head>
+    <title>Physical CCD Glitch</title>
+
+    <link data-trunk rel="rust" data-wasm-opt="2" />
+    <base data-trunk-public-url />
+
+    <meta name="theme-color" media="(prefers-color-scheme: light)" content="#909090">
+    <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#1a1a2e">
+
+    <style>
+        html {
+            touch-action: manipulation;
+        }
+
+        body {
+            background: #1a1a2e;
+            margin: 0;
+            padding: 0;
+        }
+
+        html,
+        body {
+            overflow: hidden;
+            margin: 0 !important;
+            padding: 0 !important;
+            height: 100%;
+            width: 100%;
+        }
+
+        canvas {
+            margin-right: auto;
+            margin-left: auto;
+            display: block;
+            position: absolute;
+            top: 0;
+            left: 50%;
+            transform: translate(-50%, 0%);
+        }
+
+        .loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: #00ff80;
+            font-family: 'Courier New', monospace;
+            font-size: 18px;
+            text-align: center;
+        }
+
+        .loading .spinner {
+            display: inline-block;
+            width: 28px;
+            height: 28px;
+            margin-bottom: 12px;
+        }
+
+        .loading .spinner:after {
+            content: " ";
+            display: block;
+            width: 28px;
+            height: 28px;
+            border-radius: 50%;
+            border: 3px solid #00ff80;
+            border-color: #00ff80 transparent #00ff80 transparent;
+            animation: spin 1.2s linear infinite;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+
+<body>
+    <canvas id="the_canvas_id"></canvas>
+
+    <div class="loading" id="loading">
+        <div class="spinner"></div>
+        <div>Initializing CCD Sensor...</div>
+    </div>
+
+    <script>
+        // Hide loading indicator once the canvas has content
+        const observer = new MutationObserver(() => {
+            const canvas = document.getElementById('the_canvas_id');
+            if (canvas && canvas.width > 0 && canvas.height > 0) {
+                document.getElementById('loading').style.display = 'none';
+                observer.disconnect();
+            }
+        });
+        observer.observe(document.body, { attributes: true, childList: true, subtree: true });
+
+        // Also hide on first paint
+        requestAnimationFrame(function check() {
+            const canvas = document.getElementById('the_canvas_id');
+            if (canvas && canvas.width > 0) {
+                document.getElementById('loading').style.display = 'none';
+            } else {
+                requestAnimationFrame(check);
+            }
+        });
+    </script>
+</body>
+</html>

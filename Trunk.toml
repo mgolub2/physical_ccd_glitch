@@ -1,0 +1,3 @@
+[build]
+# Output directory for the built files
+dist = "dist"

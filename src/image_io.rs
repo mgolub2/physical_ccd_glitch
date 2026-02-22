@@ -1,7 +1,7 @@
 use image::{DynamicImage, GenericImageView, ImageBuffer, Rgb, RgbImage};
-use std::path::Path;
 
-pub fn load_image(path: &Path) -> Result<DynamicImage, String> {
+#[cfg(not(target_arch = "wasm32"))]
+pub fn load_image(path: &std::path::Path) -> Result<DynamicImage, String> {
     image::open(path).map_err(|e| format!("Failed to load image: {e}"))
 }
 
@@ -34,6 +34,7 @@ pub fn resize_to_sensor(img: &DynamicImage, sensor_w: u32, sensor_h: u32) -> Rgb
     output
 }
 
-pub fn save_image(img: &RgbImage, path: &Path) -> Result<(), String> {
+#[cfg(not(target_arch = "wasm32"))]
+pub fn save_image(img: &RgbImage, path: &std::path::Path) -> Result<(), String> {
     img.save(path).map_err(|e| format!("Failed to save image: {e}"))
 }

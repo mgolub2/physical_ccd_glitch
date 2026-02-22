@@ -1,6 +1,5 @@
 use eframe::egui;
 use image::DynamicImage;
-use std::path::PathBuf;
 
 use crate::ccd::adc::CdsMode;
 use crate::ccd::transfer::ReadoutDirection;
@@ -12,7 +11,6 @@ use crate::pipeline::{self, PipelineParams};
 
 pub struct CcdGlitchApp {
     source_image: Option<DynamicImage>,
-    source_path: Option<PathBuf>,
     preview_texture: Option<egui::TextureHandle>,
     preview_width: usize,
     preview_height: usize,
@@ -21,18 +19,23 @@ pub struct CcdGlitchApp {
     needs_process: bool,
     auto_process: bool,
     processing_time_ms: f64,
+    #[cfg(target_arch = "wasm32")]
+    pending_file: std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>>,
 }
 
 impl CcdGlitchApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+        #[cfg(not(target_arch = "wasm32"))]
         let preset = SensorPreset::Kaf6303;
+        #[cfg(target_arch = "wasm32")]
+        let preset = SensorPreset::Icx059cl;
+
         let config = preset.config();
         let mut params = PipelineParams::default();
         apply_sensor_config(&mut params, &config);
 
         Self {
             source_image: None,
-            source_path: None,
             preview_texture: None,
             preview_width: 0,
             preview_height: 0,
@@ -41,9 +44,12 @@ impl CcdGlitchApp {
             needs_process: false,
             auto_process: false,
             processing_time_ms: 0.0,
+            #[cfg(target_arch = "wasm32")]
+            pending_file: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn open_image(&mut self) {
         if let Some(path) = rfd::FileDialog::new()
             .add_filter("Images", &["png", "jpg", "jpeg", "tiff", "tif", "bmp", "webp"])
@@ -52,7 +58,6 @@ impl CcdGlitchApp {
             match crate::image_io::load_image(&path) {
                 Ok(img) => {
                     self.source_image = Some(img);
-                    self.source_path = Some(path);
                     self.needs_process = true;
                 }
                 Err(e) => {
@@ -62,6 +67,78 @@ impl CcdGlitchApp {
         }
     }
 
+    #[cfg(target_arch = "wasm32")]
+    fn open_image(&self) {
+        use wasm_bindgen::prelude::*;
+        use wasm_bindgen::JsCast;
+
+        let window = match web_sys::window() {
+            Some(w) => w,
+            None => return,
+        };
+        let document = match window.document() {
+            Some(d) => d,
+            None => return,
+        };
+        let body = match document.body() {
+            Some(b) => b,
+            None => return,
+        };
+
+        let input: web_sys::HtmlInputElement = match document.create_element("input") {
+            Ok(el) => match el.dyn_into() {
+                Ok(input) => input,
+                Err(_) => return,
+            },
+            Err(_) => return,
+        };
+        input.set_type("file");
+        input.set_accept("image/png,image/jpeg,image/bmp,image/webp");
+        let _ = input.style().set_property("display", "none");
+        let _ = body.append_child(&input);
+
+        let pending = self.pending_file.clone();
+        let input_clone = input.clone();
+
+        let onchange = Closure::wrap(Box::new(move |_: web_sys::Event| {
+            let input_ref = &input_clone;
+            if let Some(files) = input_ref.files() {
+                if let Some(file) = files.get(0) {
+                    let reader = match web_sys::FileReader::new() {
+                        Ok(r) => r,
+                        Err(_) => return,
+                    };
+                    let reader_clone = reader.clone();
+                    let pending_inner = pending.clone();
+
+                    let onload = Closure::wrap(Box::new(move |_: web_sys::Event| {
+                        if let Ok(result) = reader_clone.result() {
+                            let array = js_sys::Uint8Array::new(&result);
+                            let bytes = array.to_vec();
+                            if let Ok(mut guard) = pending_inner.lock() {
+                                *guard = Some(bytes);
+                            }
+                        }
+                    }) as Box<dyn FnMut(_)>);
+
+                    reader.set_onload(Some(onload.as_ref().unchecked_ref()));
+                    onload.forget();
+                    let _ = reader.read_as_array_buffer(&file);
+                }
+            }
+            // Clean up
+            if let Some(parent) = input_ref.parent_node() {
+                let _ = parent.remove_child(input_ref);
+            }
+        }) as Box<dyn FnMut(_)>);
+
+        let _ = input.add_event_listener_with_callback("change", onchange.as_ref().unchecked_ref());
+        onchange.forget();
+
+        input.click();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     fn save_result(&self) {
         if self.preview_texture.is_none() {
             return;
@@ -83,9 +160,25 @@ impl CcdGlitchApp {
         }
     }
 
+    #[cfg(target_arch = "wasm32")]
+    fn save_result(&self) {
+        if self.preview_texture.is_none() {
+            return;
+        }
+        if let Some(source) = &self.source_image {
+            let (w, h, bytes) = pipeline::process(source, &self.params);
+            if let Some(img) = image::RgbImage::from_raw(w as u32, h as u32, bytes) {
+                let mut buf = std::io::Cursor::new(Vec::new());
+                if img.write_to(&mut buf, image::ImageFormat::Png).is_ok() {
+                    download_bytes(&buf.into_inner(), "ccd_glitch.png", "image/png");
+                }
+            }
+        }
+    }
+
     fn process_image(&mut self, ctx: &egui::Context) {
         if let Some(source) = &self.source_image {
-            let start = std::time::Instant::now();
+            let start = web_time::Instant::now();
             let (w, h, bytes) = pipeline::process(source, &self.params);
             self.processing_time_ms = start.elapsed().as_secs_f64() * 1000.0;
             self.preview_width = w;
@@ -99,6 +192,18 @@ impl CcdGlitchApp {
             ));
         }
     }
+
+    fn load_image_from_bytes(&mut self, bytes: &[u8]) {
+        match image::load_from_memory(bytes) {
+            Ok(img) => {
+                self.source_image = Some(img);
+                self.needs_process = true;
+            }
+            Err(e) => {
+                log::error!("Failed to load image from bytes: {e}");
+            }
+        }
+    }
 }
 
 fn apply_sensor_config(params: &mut PipelineParams, config: &SensorConfig) {
@@ -109,19 +214,91 @@ fn apply_sensor_config(params: &mut PipelineParams, config: &SensorConfig) {
     } else {
         config.full_well_no_abg
     };
-    params.read_noise = 0.0; // Keep at 0 by default for clean output
+    params.read_noise = 0.0;
     params.v_cte = config.cte_vertical;
     params.h_cte = config.cte_horizontal;
 }
 
+#[cfg(target_arch = "wasm32")]
+fn download_bytes(bytes: &[u8], filename: &str, mime: &str) {
+    use wasm_bindgen::JsCast;
+
+    let array = js_sys::Uint8Array::from(bytes);
+    let blob_parts = js_sys::Array::new();
+    blob_parts.push(&array);
+
+    let options = web_sys::BlobPropertyBag::new();
+    options.set_type(mime);
+
+    let blob = match web_sys::Blob::new_with_u8_array_sequence_and_options(&blob_parts, &options) {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+
+    let url = match web_sys::Url::create_object_url_with_blob(&blob) {
+        Ok(u) => u,
+        Err(_) => return,
+    };
+
+    if let Some(window) = web_sys::window() {
+        if let Some(document) = window.document() {
+            if let Ok(el) = document.create_element("a") {
+                if let Ok(a) = el.dyn_into::<web_sys::HtmlAnchorElement>() {
+                    a.set_href(&url);
+                    a.set_download(filename);
+                    a.click();
+                }
+            }
+        }
+    }
+
+    let _ = web_sys::Url::revoke_object_url(&url);
+}
+
 impl eframe::App for CcdGlitchApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Check for pending file from WASM file dialog
+        #[cfg(target_arch = "wasm32")]
+        {
+            let mut pending = self.pending_file.lock().unwrap();
+            if let Some(bytes) = pending.take() {
+                drop(pending);
+                self.load_image_from_bytes(&bytes);
+                ctx.request_repaint();
+            }
+        }
+
+        // Check for drag-and-drop
+        let dropped_files = ctx.input(|i| i.raw.dropped_files.clone());
+        if let Some(file) = dropped_files.first() {
+            if let Some(bytes) = &file.bytes {
+                self.load_image_from_bytes(bytes);
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            if let Some(path) = &file.path {
+                if let Ok(img) = crate::image_io::load_image(path) {
+                    self.source_image = Some(img);
+                    self.needs_process = true;
+                }
+            }
+        }
+
         // Top panel: file operations and preset selection
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if ui.button("Open Image").clicked() {
                     self.open_image();
                 }
+
+                #[cfg(target_arch = "wasm32")]
+                {
+                    ui.label(
+                        egui::RichText::new("or drag & drop")
+                            .small()
+                            .color(egui::Color32::from_rgb(120, 120, 140)),
+                    );
+                }
+
                 if ui.button("Save Result").clicked() {
                     self.save_result();
                 }
@@ -159,7 +336,7 @@ impl eframe::App for CcdGlitchApp {
                 }
 
                 ui.separator();
-                if self.source_path.is_some() {
+                if self.source_image.is_some() {
                     ui.label(format!(
                         "{}x{} | {:.0}ms",
                         self.params.sensor_width,
@@ -176,6 +353,17 @@ impl eframe::App for CcdGlitchApp {
             .resizable(true)
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
+                    // Circuit display at top
+                    egui::CollapsingHeader::new(
+                        egui::RichText::new("Circuit Display").monospace(),
+                    )
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        crate::circuit_display::draw_circuit(ui, &self.params);
+                    });
+
+                    ui.separator();
+
                     let mut changed = false;
                     changed |= ui_sensor_config(ui, &mut self.params, self.sensor_preset);
                     changed |= ui_exposure_noise(ui, &mut self.params);
@@ -216,7 +404,28 @@ impl eframe::App for CcdGlitchApp {
                 });
             } else {
                 ui.centered_and_justified(|ui| {
+                    #[cfg(not(target_arch = "wasm32"))]
                     ui.label("Open an image to begin");
+
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(ui.available_height() / 3.0);
+                            ui.label(
+                                egui::RichText::new("Physical CCD Glitch")
+                                    .heading()
+                                    .color(egui::Color32::from_rgb(0, 220, 110)),
+                            );
+                            ui.add_space(8.0);
+                            ui.label("Drag & drop an image here, or click Open Image");
+                            ui.add_space(4.0);
+                            ui.label(
+                                egui::RichText::new("Supported: PNG, JPEG, BMP, WebP")
+                                    .small()
+                                    .color(egui::Color32::from_rgb(120, 120, 140)),
+                            );
+                        });
+                    }
                 });
             }
         });
