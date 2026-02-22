@@ -5,6 +5,7 @@ mod color;
 mod glitch;
 mod image_io;
 mod pipeline;
+mod waveform_display;
 
 #[cfg(not(target_arch = "wasm32"))]
 fn main() -> eframe::Result {
@@ -53,5 +54,10 @@ fn main() {
             )
             .await
             .expect("Failed to start eframe");
+
+        // Remove loading indicator now that the app is running
+        if let Some(loading) = document.get_element_by_id("loading_text") {
+            loading.remove();
+        }
     });
 }

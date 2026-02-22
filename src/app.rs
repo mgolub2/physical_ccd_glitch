@@ -362,6 +362,15 @@ impl eframe::App for CcdGlitchApp {
                         crate::circuit_display::draw_circuit(ui, &self.params);
                     });
 
+                    // Waveform display
+                    egui::CollapsingHeader::new(
+                        egui::RichText::new("Waveforms").monospace(),
+                    )
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        crate::waveform_display::draw_waveforms(ui, &self.params);
+                    });
+
                     ui.separator();
 
                     let mut changed = false;
