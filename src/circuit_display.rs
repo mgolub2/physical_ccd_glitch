@@ -6,10 +6,23 @@ struct PipelineStage {
     label: &'static str,
     active: bool,
     effects: Vec<(&'static str, bool)>,
+    #[cfg(feature = "spice")]
+    spice_driven: bool,
 }
 
 fn pipeline_stages(p: &PipelineParams) -> Vec<PipelineStage> {
     let d = PipelineParams::default();
+
+    // Determine which stages are replaced by SPICE
+    #[cfg(feature = "spice")]
+    let spice_mode = p.spice.mode;
+    #[cfg(feature = "spice")]
+    let spice_full = spice_mode == crate::spice::SpiceMode::FullReadout;
+    #[cfg(feature = "spice")]
+    let spice_amp = spice_mode == crate::spice::SpiceMode::AmplifierOnly
+        || spice_mode == crate::spice::SpiceMode::FullReadout;
+    #[cfg(feature = "spice")]
+    let spice_tf = spice_mode == crate::spice::SpiceMode::TransferCurveOnly;
 
     vec![
         PipelineStage {
@@ -18,11 +31,15 @@ fn pipeline_stages(p: &PipelineParams) -> Vec<PipelineStage> {
             effects: vec![
                 ("ABG", p.use_abg),
             ],
+            #[cfg(feature = "spice")]
+            spice_driven: false,
         },
         PipelineStage {
             label: "CFA",
             active: p.bayer_pattern != d.bayer_pattern,
             effects: vec![],
+            #[cfg(feature = "spice")]
+            spice_driven: false,
         },
         PipelineStage {
             label: "NOISE",
@@ -34,6 +51,8 @@ fn pipeline_stages(p: &PipelineParams) -> Vec<PipelineStage> {
                 ("Shot", p.shot_noise_enabled),
                 ("Read", p.read_noise > 0.0),
             ],
+            #[cfg(feature = "spice")]
+            spice_driven: false,
         },
         PipelineStage {
             label: "BLOOM",
@@ -44,6 +63,8 @@ fn pipeline_stages(p: &PipelineParams) -> Vec<PipelineStage> {
                 ("ABG", p.abg_strength < 1.0),
                 ("Vert", p.bloom_vertical),
             ],
+            #[cfg(feature = "spice")]
+            spice_driven: spice_full,
         },
         PipelineStage {
             label: "V-CLK",
@@ -57,6 +78,8 @@ fn pipeline_stages(p: &PipelineParams) -> Vec<PipelineStage> {
                 ("Wave", p.v_waveform_distortion > 0.0),
                 ("Smear", p.parallel_smear > 0.0),
             ],
+            #[cfg(feature = "spice")]
+            spice_driven: spice_full,
         },
         PipelineStage {
             label: "H-CLK",
@@ -69,6 +92,8 @@ fn pipeline_stages(p: &PipelineParams) -> Vec<PipelineStage> {
                 ("Glitch", p.h_glitch_rate > 0.0),
                 ("Ring", p.h_ringing > 0.0),
             ],
+            #[cfg(feature = "spice")]
+            spice_driven: spice_full,
         },
         PipelineStage {
             label: "AMP",
@@ -82,6 +107,8 @@ fn pipeline_stages(p: &PipelineParams) -> Vec<PipelineStage> {
                 ("kTC", p.reset_noise > 0.0),
                 ("Glow", p.amp_glow > 0.0),
             ],
+            #[cfg(feature = "spice")]
+            spice_driven: spice_amp || spice_tf,
         },
         PipelineStage {
             label: "ADC",
@@ -98,6 +125,8 @@ fn pipeline_stages(p: &PipelineParams) -> Vec<PipelineStage> {
                 ("Err", p.bit_errors > 0.0),
                 ("Jit", p.adc_jitter > 0.0),
             ],
+            #[cfg(feature = "spice")]
+            spice_driven: spice_amp,
         },
         PipelineStage {
             label: "GLITCH",
@@ -114,11 +143,15 @@ fn pipeline_stages(p: &PipelineParams) -> Vec<PipelineStage> {
                 ("XOR", p.bit_xor_mask > 0),
                 ("Rot", p.bit_rotation != 0),
             ],
+            #[cfg(feature = "spice")]
+            spice_driven: false,
         },
         PipelineStage {
             label: "DEMSC",
             active: p.demosaic_algo != d.demosaic_algo,
             effects: vec![],
+            #[cfg(feature = "spice")]
+            spice_driven: false,
         },
         PipelineStage {
             label: "COLOR",
@@ -152,6 +185,8 @@ fn pipeline_stages(p: &PipelineParams) -> Vec<PipelineStage> {
                     || (p.white_balance_g - 1.0).abs() > 0.001
                     || (p.white_balance_b - 1.0).abs() > 0.001),
             ],
+            #[cfg(feature = "spice")]
+            spice_driven: false,
         },
     ]
 }
@@ -171,6 +206,12 @@ const DOT_ACTIVE: egui::Color32 = egui::Color32::from_rgb(0, 255, 100);
 const DOT_INACTIVE: egui::Color32 = egui::Color32::from_rgb(50, 50, 60);
 const PIN_COLOR: egui::Color32 = egui::Color32::from_rgb(180, 180, 160);
 const CHIP_LABEL: egui::Color32 = egui::Color32::from_rgb(80, 85, 100);
+#[cfg(feature = "spice")]
+const SPICE_BORDER: egui::Color32 = egui::Color32::from_rgb(255, 180, 40);
+#[cfg(feature = "spice")]
+const SPICE_FILL: egui::Color32 = egui::Color32::from_rgb(40, 30, 8);
+#[cfg(feature = "spice")]
+const SPICE_TEXT: egui::Color32 = egui::Color32::from_rgb(255, 200, 60);
 
 pub fn draw_circuit(ui: &mut egui::Ui, params: &PipelineParams) {
     let stages = pipeline_stages(params);
@@ -265,7 +306,17 @@ pub fn draw_circuit(ui: &mut egui::Ui, params: &PipelineParams) {
         );
 
         // Draw block
-        let (fill, stroke_color, text_color) = if stage.active {
+        #[cfg(feature = "spice")]
+        let is_spice = stage.spice_driven;
+        #[cfg(not(feature = "spice"))]
+        let is_spice = false;
+
+        let (fill, stroke_color, text_color) = if is_spice {
+            #[cfg(feature = "spice")]
+            { (SPICE_FILL, SPICE_BORDER, SPICE_TEXT) }
+            #[cfg(not(feature = "spice"))]
+            { (ACTIVE_FILL, ACTIVE_BORDER, ACTIVE_TEXT) }
+        } else if stage.active {
             (ACTIVE_FILL, ACTIVE_BORDER, ACTIVE_TEXT)
         } else {
             (INACTIVE_FILL, INACTIVE_BORDER, INACTIVE_TEXT)

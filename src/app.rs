@@ -21,6 +21,8 @@ pub struct CcdGlitchApp {
     processing_time_ms: f64,
     #[cfg(target_arch = "wasm32")]
     pending_file: std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>>,
+    #[cfg(feature = "spice")]
+    spice_cache: Option<crate::spice::SpiceCache>,
 }
 
 impl CcdGlitchApp {
@@ -46,6 +48,8 @@ impl CcdGlitchApp {
             processing_time_ms: 0.0,
             #[cfg(target_arch = "wasm32")]
             pending_file: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(feature = "spice")]
+            spice_cache: None,
         }
     }
 
@@ -150,7 +154,12 @@ impl CcdGlitchApp {
             .save_file()
         {
             if let Some(source) = &self.source_image {
-                let (w, h, bytes) = pipeline::process(source, &self.params);
+                let (w, h, bytes) = pipeline::process(
+                    source,
+                    &self.params,
+                    #[cfg(feature = "spice")]
+                    &self.spice_cache,
+                );
                 let img = image::RgbImage::from_raw(w as u32, h as u32, bytes)
                     .expect("Failed to create image buffer");
                 if let Err(e) = crate::image_io::save_image(&img, &path) {
@@ -166,7 +175,12 @@ impl CcdGlitchApp {
             return;
         }
         if let Some(source) = &self.source_image {
-            let (w, h, bytes) = pipeline::process(source, &self.params);
+            let (w, h, bytes) = pipeline::process(
+                source,
+                &self.params,
+                #[cfg(feature = "spice")]
+                &self.spice_cache,
+            );
             if let Some(img) = image::RgbImage::from_raw(w as u32, h as u32, bytes) {
                 let mut buf = std::io::Cursor::new(Vec::new());
                 if img.write_to(&mut buf, image::ImageFormat::Png).is_ok() {
@@ -178,8 +192,26 @@ impl CcdGlitchApp {
 
     fn process_image(&mut self, ctx: &egui::Context) {
         if let Some(source) = &self.source_image {
+            // Run SPICE simulation if needed
+            #[cfg(feature = "spice")]
+            {
+                use crate::spice::SpiceMode;
+                if self.params.spice.mode != SpiceMode::Off {
+                    crate::spice::simulate_or_cache(
+                        &self.params.spice,
+                        self.params.full_well,
+                        &mut self.spice_cache,
+                    );
+                }
+            }
+
             let start = web_time::Instant::now();
-            let (w, h, bytes) = pipeline::process(source, &self.params);
+            let (w, h, bytes) = pipeline::process(
+                source,
+                &self.params,
+                #[cfg(feature = "spice")]
+                &self.spice_cache,
+            );
             self.processing_time_ms = start.elapsed().as_secs_f64() * 1000.0;
             self.preview_width = w;
             self.preview_height = h;
@@ -368,13 +400,35 @@ impl eframe::App for CcdGlitchApp {
                     )
                     .default_open(true)
                     .show(ui, |ui| {
-                        crate::waveform_display::draw_waveforms(ui, &self.params);
+                        #[cfg(feature = "spice")]
+                        {
+                            crate::waveform_display::draw_waveforms_with_spice(
+                                ui,
+                                &self.params,
+                                &self.spice_cache,
+                            );
+                        }
+                        #[cfg(not(feature = "spice"))]
+                        {
+                            crate::waveform_display::draw_waveforms(ui, &self.params);
+                        }
                     });
 
                     ui.separator();
 
                     let mut changed = false;
                     changed |= ui_sensor_config(ui, &mut self.params, self.sensor_preset);
+
+                    #[cfg(feature = "spice")]
+                    {
+                        let (spice_changed, force_sim) = ui_spice_mode(ui, &mut self.params, &self.spice_cache);
+                        changed |= spice_changed;
+                        if force_sim {
+                            crate::spice::cache::invalidate(&mut self.spice_cache);
+                            self.needs_process = true;
+                        }
+                    }
+
                     changed |= ui_exposure_noise(ui, &mut self.params);
                     changed |= ui_blooming(ui, &mut self.params);
                     changed |= ui_v_clock(ui, &mut self.params);
@@ -761,6 +815,144 @@ fn ui_channel(ui: &mut egui::Ui, params: &mut PipelineParams) -> bool {
             ).changed();
         });
     changed
+}
+
+#[cfg(feature = "spice")]
+fn ui_spice_mode(
+    ui: &mut egui::Ui,
+    params: &mut PipelineParams,
+    cache: &Option<crate::spice::SpiceCache>,
+) -> (bool, bool) {
+    use crate::spice::SpiceMode;
+
+    let mut changed = false;
+    let mut force_simulate = false;
+
+    egui::CollapsingHeader::new(
+        egui::RichText::new("SPICE Mode").color(egui::Color32::from_rgb(255, 180, 40)),
+    )
+    .default_open(false)
+    .show(ui, |ui| {
+        // Mode selector
+        let mode_name = params.spice.mode.name();
+        egui::ComboBox::from_label("Mode")
+            .selected_text(mode_name)
+            .show_ui(ui, |ui| {
+                for &mode in SpiceMode::ALL {
+                    changed |= ui
+                        .selectable_value(&mut params.spice.mode, mode, mode.name())
+                        .changed();
+                }
+            });
+
+        let is_active = params.spice.mode != SpiceMode::Off;
+
+        if is_active {
+            ui.separator();
+            ui.label("Circuit Parameters");
+
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut params.spice.vdd, 5.0..=20.0)
+                        .text("VDD (V)"),
+                )
+                .changed();
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut params.spice.clock_freq_mhz, 0.1..=50.0)
+                        .text("Clock (MHz)"),
+                )
+                .changed();
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut params.spice.temperature_k, 200.0..=400.0)
+                        .text("Temp (K)"),
+                )
+                .changed();
+
+            let mut stages = params.spice.shift_register_stages as i32;
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut stages, 2..=16).text("SR Stages"),
+                )
+                .changed();
+            params.spice.shift_register_stages = stages as usize;
+
+            let mut res = params.spice.transfer_function_resolution as i32;
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut res, 8..=128).text("TF Resolution"),
+                )
+                .changed();
+            params.spice.transfer_function_resolution = res as usize;
+
+            ui.separator();
+            ui.label("Glitch Parameters");
+
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut params.spice.supply_droop, 0.0..=0.8)
+                        .text("Supply Droop"),
+                )
+                .changed();
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut params.spice.phase_overlap_ns, 0.0..=100.0)
+                        .text("Phase Overlap (ns)"),
+                )
+                .changed();
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut params.spice.missing_pulse_rate, 0.0..=0.5)
+                        .text("Missing Pulses"),
+                )
+                .changed();
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut params.spice.charge_injection, 0.0..=2.0)
+                        .text("Charge Injection"),
+                )
+                .changed();
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut params.spice.substrate_noise, 0.0..=1.0)
+                        .text("Substrate Noise"),
+                )
+                .changed();
+
+            ui.separator();
+
+            if ui.button("Simulate").clicked() {
+                force_simulate = true;
+            }
+
+            // Status
+            let status = crate::spice::cache::cache_summary(cache);
+            ui.label(
+                egui::RichText::new(status)
+                    .small()
+                    .color(egui::Color32::from_rgb(120, 120, 140)),
+            );
+
+            // Show which stages are replaced
+            ui.separator();
+            let replaced = match params.spice.mode {
+                SpiceMode::FullReadout => "Replaces: Bloom, V-CLK, H-CLK, AMP, ADC",
+                SpiceMode::AmplifierOnly => "Replaces: AMP, ADC",
+                SpiceMode::TransferCurveOnly => "Replaces: AMP (nonlinearity)",
+                SpiceMode::Off => "",
+            };
+            if !replaced.is_empty() {
+                ui.label(
+                    egui::RichText::new(replaced)
+                        .small()
+                        .color(egui::Color32::from_rgb(255, 180, 40)),
+                );
+            }
+        }
+    });
+
+    (changed, force_simulate)
 }
 
 fn ui_color_output(ui: &mut egui::Ui, params: &mut PipelineParams) -> bool {

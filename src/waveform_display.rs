@@ -9,6 +9,7 @@ const SCOPE_BORDER: egui::Color32 = egui::Color32::from_rgb(35, 45, 40);
 const TRACE_GREEN: egui::Color32 = egui::Color32::from_rgb(0, 255, 80);
 const TRACE_CYAN: egui::Color32 = egui::Color32::from_rgb(0, 190, 255);
 const TRACE_YELLOW: egui::Color32 = egui::Color32::from_rgb(255, 220, 0);
+#[allow(dead_code)]
 const TRACE_MAGENTA: egui::Color32 = egui::Color32::from_rgb(255, 80, 200);
 const LABEL_DIM: egui::Color32 = egui::Color32::from_rgb(80, 90, 80);
 
@@ -23,10 +24,153 @@ const TEST_PIXELS: [f32; NUM_PIXELS] = [
     0.10, 0.95, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10,
 ];
 
+#[cfg(feature = "spice")]
+const TRACE_SPICE: egui::Color32 = egui::Color32::from_rgb(255, 80, 40);
+
+#[cfg_attr(feature = "spice", allow(dead_code))]
 pub fn draw_waveforms(ui: &mut egui::Ui, params: &PipelineParams) {
     draw_clock_panel(ui, params);
     ui.add_space(2.0);
     draw_video_panel(ui, params);
+}
+
+/// Draw waveforms with optional SPICE overlay.
+#[cfg(feature = "spice")]
+pub fn draw_waveforms_with_spice(
+    ui: &mut egui::Ui,
+    params: &PipelineParams,
+    cache: &Option<crate::spice::SpiceCache>,
+) {
+    draw_clock_panel(ui, params);
+    ui.add_space(2.0);
+    draw_video_panel_with_spice(ui, params, cache);
+}
+
+/// Video output panel with SPICE transfer curve overlay.
+#[cfg(feature = "spice")]
+fn draw_video_panel_with_spice(
+    ui: &mut egui::Ui,
+    params: &PipelineParams,
+    cache: &Option<crate::spice::SpiceCache>,
+) {
+    let width = ui.available_width();
+    let height = 80.0;
+    let (response, painter) = ui.allocate_painter(
+        egui::vec2(width, height),
+        egui::Sense::hover(),
+    );
+    let rect = response.rect;
+
+    draw_scope_bg(&painter, rect);
+
+    let (analog, digital) = generate_video_signal(params);
+
+    let trace_rect = egui::Rect::from_min_size(
+        egui::pos2(rect.min.x + 2.0, rect.min.y + 10.0),
+        egui::vec2(width - 4.0, height - 14.0),
+    );
+
+    // Draw analog trace
+    draw_analog_trace(&painter, trace_rect, &analog, TRACE_GREEN, 1.2);
+
+    // Draw digital (ADC) trace if different from analog
+    if params.bit_depth < 16 || params.dnl_errors > 0.0 || params.bit_errors > 0.0 {
+        draw_analog_trace(&painter, trace_rect, &digital, TRACE_CYAN.gamma_multiply(0.6), 1.0);
+    }
+
+    // SPICE transfer curve overlay
+    if let Some(cache) = cache {
+        if !cache.transfer_curve.is_empty() {
+            let spice_trace = generate_spice_video_signal(params, &cache.transfer_curve);
+            draw_analog_trace(&painter, trace_rect, &spice_trace, TRACE_SPICE, 1.5);
+        }
+    }
+
+    // Labels
+    painter.text(
+        egui::pos2(rect.min.x + 3.0, rect.min.y + 2.0),
+        egui::Align2::LEFT_TOP,
+        "VIDEO OUT",
+        egui::FontId::monospace(7.0),
+        LABEL_DIM,
+    );
+
+    if cache.is_some() {
+        painter.text(
+            egui::pos2(rect.max.x - 3.0, rect.min.y + 2.0),
+            egui::Align2::RIGHT_TOP,
+            "SPICE",
+            egui::FontId::monospace(7.0),
+            TRACE_SPICE.gamma_multiply(0.7),
+        );
+    }
+
+    if params.bit_depth < 16 || params.dnl_errors > 0.0 || params.bit_errors > 0.0 {
+        painter.text(
+            egui::pos2(rect.center().x, rect.min.y + 2.0),
+            egui::Align2::CENTER_TOP,
+            &format!("ADC {}bit", params.bit_depth),
+            egui::FontId::monospace(7.0),
+            TRACE_CYAN.gamma_multiply(0.5),
+        );
+    }
+}
+
+/// Generate a video signal using the SPICE transfer curve applied to test pixels.
+#[cfg(feature = "spice")]
+fn generate_spice_video_signal(
+    params: &PipelineParams,
+    transfer_curve: &[(f64, f64)],
+) -> Vec<f32> {
+    let mut pixels = TEST_PIXELS.to_vec();
+
+    // Apply gain
+    let gain = params.amp_gain as f32;
+    for v in pixels.iter_mut() {
+        *v *= gain;
+    }
+
+    // Apply SPICE transfer function
+    if transfer_curve.len() >= 2 {
+        let v_max = transfer_curve.last().map(|p| p.1).unwrap_or(1.0);
+        for v in pixels.iter_mut() {
+            let t = (*v as f64).clamp(0.0, 1.0) * (transfer_curve.len() - 1) as f64;
+            let lo = t.floor() as usize;
+            let hi = (lo + 1).min(transfer_curve.len() - 1);
+            let frac = t - lo as f64;
+            let v_out = transfer_curve[lo].1 * (1.0 - frac) + transfer_curve[hi].1 * frac;
+            if v_max > 0.0 {
+                *v = (v_out / v_max) as f32;
+            }
+        }
+    }
+
+    // Build per-sample waveform (simplified)
+    let mut signal = vec![0.0f32; NUM_SAMPLES];
+    for px in 0..NUM_PIXELS {
+        let sig = pixels[px].clamp(0.0, 1.0);
+        let base = px * SAMPLES_PER_PIXEL;
+        for s in 0..SAMPLES_PER_PIXEL {
+            let t = s as f32 / SAMPLES_PER_PIXEL as f32;
+            let idx = base + s;
+            if idx >= NUM_SAMPLES {
+                break;
+            }
+            signal[idx] = if t < 0.12 {
+                0.03
+            } else if t < 0.20 {
+                let rise = (t - 0.12) / 0.08;
+                0.03 + rise * (sig - 0.03)
+            } else if t < 0.82 {
+                sig
+            } else {
+                let fall = (t - 0.82) / 0.18;
+                sig * (1.0 - fall) + 0.03 * fall
+            };
+        }
+    }
+
+    signal
 }
 
 // --- Clock timing diagram ---
@@ -104,6 +248,7 @@ fn draw_clock_panel(ui: &mut egui::Ui, params: &PipelineParams) {
 
 // --- Video output (analog + ADC) ---
 
+#[cfg_attr(feature = "spice", allow(dead_code))]
 fn draw_video_panel(ui: &mut egui::Ui, params: &PipelineParams) {
     let width = ui.available_width();
     let height = 80.0;

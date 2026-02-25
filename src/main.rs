@@ -5,6 +5,8 @@ mod color;
 mod glitch;
 mod image_io;
 mod pipeline;
+#[cfg(feature = "spice")]
+mod spice;
 mod waveform_display;
 
 #[cfg(not(target_arch = "wasm32"))]

@@ -88,6 +88,10 @@ pub struct PipelineParams {
     pub gamma: f64,
     pub brightness: f64,
     pub contrast: f64,
+
+    // SPICE simulation
+    #[cfg(feature = "spice")]
+    pub spice: crate::spice::SpiceParams,
 }
 
 impl Default for PipelineParams {
@@ -156,6 +160,9 @@ impl Default for PipelineParams {
             gamma: 2.2,
             brightness: 0.0,
             contrast: 1.0,
+
+            #[cfg(feature = "spice")]
+            spice: crate::spice::SpiceParams::default(),
         }
     }
 }
@@ -165,6 +172,7 @@ impl Default for PipelineParams {
 pub fn process(
     source: &image::DynamicImage,
     params: &PipelineParams,
+    #[cfg(feature = "spice")] spice_cache: &Option<crate::spice::SpiceCache>,
 ) -> (usize, usize, Vec<u8>) {
     let w = params.sensor_width;
     let h = params.sensor_height;
@@ -187,64 +195,79 @@ pub fn process(
     }
     sensor::add_read_noise(&mut mosaic, params.read_noise);
 
-    // Step 4: Blooming
-    blooming::apply_blooming(
+    // SPICE branch: replace mathematical pipeline stages with circuit-derived processing
+    #[cfg(feature = "spice")]
+    let spice_handled = process_spice_branch(
         &mut mosaic,
         width,
         height,
-        params.full_well,
-        params.abg_strength,
-        params.bloom_threshold,
-        params.bloom_vertical,
+        params,
+        spice_cache,
     );
 
-    // Step 5: Vertical (parallel) transfer
-    transfer::vertical_transfer(
-        &mut mosaic,
-        width,
-        height,
-        params.v_cte,
-        params.v_glitch_rate,
-        params.v_waveform_distortion,
-        params.parallel_smear,
-    );
+    #[cfg(not(feature = "spice"))]
+    let spice_handled = false;
 
-    // Step 6: Horizontal (serial) transfer
-    transfer::horizontal_transfer(
-        &mut mosaic,
-        width,
-        height,
-        params.h_cte,
-        params.h_glitch_rate,
-        params.h_ringing,
-        params.readout_direction,
-    );
+    if !spice_handled {
+        // Step 4: Blooming
+        blooming::apply_blooming(
+            &mut mosaic,
+            width,
+            height,
+            params.full_well,
+            params.abg_strength,
+            params.bloom_threshold,
+            params.bloom_vertical,
+        );
 
-    // Step 7: Output amplifier
-    amplifier::apply_amplifier(
-        &mut mosaic,
-        width,
-        height,
-        params.amp_gain,
-        params.nonlinearity,
-        params.reset_noise,
-        params.amp_glow,
-    );
+        // Step 5: Vertical (parallel) transfer
+        transfer::vertical_transfer(
+            &mut mosaic,
+            width,
+            height,
+            params.v_cte,
+            params.v_glitch_rate,
+            params.v_waveform_distortion,
+            params.parallel_smear,
+        );
 
-    // Step 8: ADC
-    adc::apply_adc(
-        &mut mosaic,
-        width,
-        height,
-        params.bit_depth,
-        params.cds_mode,
-        params.adc_gain,
-        params.bias,
-        params.reset_noise,
-        params.dnl_errors,
-        params.bit_errors,
-        params.adc_jitter,
-    );
+        // Step 6: Horizontal (serial) transfer
+        transfer::horizontal_transfer(
+            &mut mosaic,
+            width,
+            height,
+            params.h_cte,
+            params.h_glitch_rate,
+            params.h_ringing,
+            params.readout_direction,
+        );
+
+        // Step 7: Output amplifier
+        amplifier::apply_amplifier(
+            &mut mosaic,
+            width,
+            height,
+            params.amp_gain,
+            params.nonlinearity,
+            params.reset_noise,
+            params.amp_glow,
+        );
+
+        // Step 8: ADC
+        adc::apply_adc(
+            &mut mosaic,
+            width,
+            height,
+            params.bit_depth,
+            params.cds_mode,
+            params.adc_gain,
+            params.bias,
+            params.reset_noise,
+            params.dnl_errors,
+            params.bit_errors,
+            params.adc_jitter,
+        );
+    }
 
     // Step 9a: Pre-demosaic glitch effects
     let max_code = ((1u64 << params.bit_depth) - 1) as f64;
@@ -321,4 +344,185 @@ pub fn process(
 
     let bytes = spectral::rgb_to_bytes(&rgb, width, height);
     (width, height, bytes)
+}
+
+/// Process using SPICE-derived transfer function and timing artifacts.
+///
+/// Returns true if SPICE processing was applied (replacing math pipeline stages),
+/// false if SPICE mode is Off or no cache is available.
+#[cfg(feature = "spice")]
+fn process_spice_branch(
+    mosaic: &mut [f64],
+    width: usize,
+    height: usize,
+    params: &PipelineParams,
+    spice_cache: &Option<crate::spice::SpiceCache>,
+) -> bool {
+    use crate::spice::{SpiceMode, transfer_function};
+
+    if params.spice.mode == SpiceMode::Off {
+        return false;
+    }
+
+    let cache = match spice_cache {
+        Some(c) => c,
+        None => return false,
+    };
+
+    match params.spice.mode {
+        SpiceMode::Off => false,
+
+        SpiceMode::FullReadout => {
+            // Replace blooming + v-clock + h-clock + amplifier + ADC
+            // with SPICE-derived transfer function + timing artifacts
+
+            // Apply missing-pulse row artifacts before other processing
+            transfer_function::apply_missing_pulses(
+                mosaic,
+                width,
+                height,
+                params.spice.missing_pulse_rate,
+            );
+
+            // Apply transfer function (replaces amplifier nonlinearity + gain)
+            transfer_function::apply_transfer_function(
+                mosaic,
+                &cache.transfer_curve,
+                params.full_well,
+            );
+
+            // Apply ringing (replaces h_ringing)
+            transfer_function::apply_ringing(mosaic, width, height, &cache.ringing_kernel);
+
+            // Quantize to bit depth (simple version replacing full ADC)
+            let max_code = ((1u64 << params.bit_depth) - 1) as f64;
+            for val in mosaic.iter_mut() {
+                let normalized = (*val / params.full_well).clamp(0.0, 1.0);
+                *val = (normalized * max_code).round();
+            }
+
+            true
+        }
+
+        SpiceMode::AmplifierOnly => {
+            // Keep existing blooming + transfer, replace amp + ADC with SPICE
+
+            // Apply missing-pulse row artifacts before other processing
+            transfer_function::apply_missing_pulses(
+                mosaic,
+                width,
+                height,
+                params.spice.missing_pulse_rate,
+            );
+
+            // Run mathematical blooming and transfer first
+            crate::ccd::blooming::apply_blooming(
+                mosaic,
+                width,
+                height,
+                params.full_well,
+                params.abg_strength,
+                params.bloom_threshold,
+                params.bloom_vertical,
+            );
+            crate::ccd::transfer::vertical_transfer(
+                mosaic,
+                width,
+                height,
+                params.v_cte,
+                params.v_glitch_rate,
+                params.v_waveform_distortion,
+                params.parallel_smear,
+            );
+            crate::ccd::transfer::horizontal_transfer(
+                mosaic,
+                width,
+                height,
+                params.h_cte,
+                params.h_glitch_rate,
+                params.h_ringing,
+                params.readout_direction,
+            );
+
+            // Replace amp + ADC with SPICE transfer function
+            transfer_function::apply_transfer_function(
+                mosaic,
+                &cache.transfer_curve,
+                params.full_well,
+            );
+
+            let max_code = ((1u64 << params.bit_depth) - 1) as f64;
+            for val in mosaic.iter_mut() {
+                let normalized = (*val / params.full_well).clamp(0.0, 1.0);
+                *val = (normalized * max_code).round();
+            }
+
+            true
+        }
+
+        SpiceMode::TransferCurveOnly => {
+            // Run the full mathematical pipeline except apply SPICE transfer curve
+            // instead of the mathematical amplifier nonlinearity
+
+            // Apply missing-pulse row artifacts before other processing
+            transfer_function::apply_missing_pulses(
+                mosaic,
+                width,
+                height,
+                params.spice.missing_pulse_rate,
+            );
+
+            crate::ccd::blooming::apply_blooming(
+                mosaic,
+                width,
+                height,
+                params.full_well,
+                params.abg_strength,
+                params.bloom_threshold,
+                params.bloom_vertical,
+            );
+            crate::ccd::transfer::vertical_transfer(
+                mosaic,
+                width,
+                height,
+                params.v_cte,
+                params.v_glitch_rate,
+                params.v_waveform_distortion,
+                params.parallel_smear,
+            );
+            crate::ccd::transfer::horizontal_transfer(
+                mosaic,
+                width,
+                height,
+                params.h_cte,
+                params.h_glitch_rate,
+                params.h_ringing,
+                params.readout_direction,
+            );
+
+            // SPICE transfer curve replaces amplifier
+            transfer_function::apply_transfer_function(
+                mosaic,
+                &cache.transfer_curve,
+                params.full_well,
+            );
+
+            // Keep mathematical ADC
+            crate::ccd::adc::apply_adc(
+                mosaic,
+                width,
+                height,
+                params.bit_depth,
+                params.cds_mode,
+                params.adc_gain,
+                params.bias,
+                params.reset_noise,
+                params.dnl_errors,
+                params.bit_errors,
+                params.adc_jitter,
+            );
+
+            true
+        }
+    }
 }
