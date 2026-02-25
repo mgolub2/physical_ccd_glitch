@@ -70,6 +70,112 @@ pub fn build_clock_driver_json(params: &SpiceParams) -> String {
     super::models::build_circuit_json("clock_driver", &signal_refs, &comps_json)
 }
 
+/// Run clock driver simulation to extract ringing kernel and clock waveforms.
+///
+/// Returns (ringing_kernel, [phi1_waveform, phi2_waveform, phi3_waveform], analytical_fallback).
+/// Falls back to analytical models on SPICE failure.
+pub fn run_clock_simulation(params: &SpiceParams) -> (Vec<f64>, [Vec<f64>; 3], bool) {
+    use std::panic;
+
+    let params = params.clone();
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        try_clock_simulation(&params)
+    }));
+
+    match result {
+        Ok(Some((kernel, waveforms))) => {
+            log::info!(
+                "Clock driver SPICE simulation succeeded: {} kernel taps",
+                kernel.len()
+            );
+            (kernel, waveforms, false)
+        }
+        _ => {
+            log::warn!("Clock driver SPICE simulation failed, falling back to analytical");
+            let kernel = analytical_ringing_kernel(&params);
+            let (phi1, phi2, phi3) = generate_clock_pattern(
+                4,
+                64,
+                params.effective_vdd(),
+                params.phase_overlap_ns,
+                1.0 / (params.clock_freq_mhz * 1e6),
+            );
+            (kernel, [phi1, phi2, phi3], true)
+        }
+    }
+}
+
+fn try_clock_simulation(params: &SpiceParams) -> Option<(Vec<f64>, [Vec<f64>; 3])> {
+    use spice21::circuit::Ckt;
+
+    let json = build_clock_driver_json(params);
+    let ckt = Ckt::from_json(&json).ok()?;
+
+    let opts = spice21::analysis::TranOptions {
+        tstep: 0.1e-9,
+        tstop: 500e-9,
+        ..Default::default()
+    };
+
+    let result = spice21::analysis::tran(ckt, None, Some(opts)).ok()?;
+
+    let clk1 = result.map.get("clk_out1")?.clone();
+    let clk2 = result.map.get("clk_out2").cloned().unwrap_or_default();
+    let clk3 = result.map.get("clk_out3").cloned().unwrap_or_default();
+
+    if clk1.len() < 10 {
+        return None;
+    }
+
+    // Extract ringing kernel from clk_out1 settling
+    let steady_state = clk1.last().copied().unwrap_or(0.0);
+    let kernel: Vec<f64> = clk1
+        .iter()
+        .rev()
+        .take(16)
+        .rev()
+        .map(|&v| v - steady_state)
+        .collect();
+
+    let max_abs = kernel.iter().map(|v| v.abs()).fold(0.0f64, f64::max);
+    let normalized_kernel = if max_abs > 1e-10 {
+        kernel.iter().map(|v| v / max_abs * 0.1).collect()
+    } else {
+        // Fallback: no significant ringing detected
+        analytical_ringing_kernel(params)
+    };
+
+    Some((normalized_kernel, [clk1, clk2, clk3]))
+}
+
+fn analytical_ringing_kernel(params: &SpiceParams) -> Vec<f64> {
+    let kernel_len = 8;
+    let ring_freq_pixels = 0.3;
+    let omega = 2.0 * std::f64::consts::PI * ring_freq_pixels;
+
+    let freq_factor = (params.clock_freq_mhz / 10.0).min(3.0);
+    let damping = 0.4 / freq_factor.max(0.5);
+
+    let clock_period_ns = 1e3 / params.clock_freq_mhz;
+    let overlap_fraction = if params.phase_overlap_ns > 0.0 {
+        (params.phase_overlap_ns / clock_period_ns).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let overlap_amp_boost = 1.0 + overlap_fraction * 2.0;
+    let overlap_damping_factor = 1.0 - overlap_fraction * 0.5;
+
+    let ring_amplitude = (0.02 + params.supply_droop * 0.1) * overlap_amp_boost;
+    let effective_damping = damping * overlap_damping_factor.max(0.1);
+
+    (0..kernel_len)
+        .map(|i| {
+            let t = i as f64;
+            ring_amplitude * (-effective_damping * t).exp() * (omega * t).sin()
+        })
+        .collect()
+}
+
 /// Calculate ringing parameters from LC circuit.
 ///
 /// The clock bus forms an LC circuit with bond wire inductance and bus capacitance.

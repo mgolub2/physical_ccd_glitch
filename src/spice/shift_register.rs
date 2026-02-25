@@ -80,3 +80,84 @@ pub fn build_shift_register_json(n_stages: usize, params: &SpiceParams) -> Strin
     let comps_json = format!("[{}]", comps.join(",\n"));
     super::models::build_circuit_json("shift_register", &signal_refs, &comps_json)
 }
+
+/// Run shift register simulation to extract effective CTE per stage.
+///
+/// Returns (cte, analytical_fallback).
+/// Falls back to analytical estimate on SPICE failure.
+pub fn run_shift_register_simulation(params: &SpiceParams) -> (f64, bool) {
+    use std::panic;
+
+    let params = params.clone();
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        try_shift_register_simulation(&params)
+    }));
+
+    match result {
+        Ok(Some(cte)) => {
+            log::info!("Shift register SPICE simulation succeeded: CTE={:.6}", cte);
+            (cte, false)
+        }
+        _ => {
+            log::warn!("Shift register SPICE simulation failed, falling back to analytical");
+            (analytical_cte(params.shift_register_stages, &params), true)
+        }
+    }
+}
+
+fn try_shift_register_simulation(params: &SpiceParams) -> Option<f64> {
+    use spice21::circuit::Ckt;
+
+    let n_stages = params.shift_register_stages.clamp(2, 16);
+    let json = build_shift_register_json(n_stages, params);
+
+    let ckt = Ckt::from_json(&json).ok()?;
+    let opts = spice21::analysis::TranOptions {
+        tstep: 1e-10,
+        tstop: 500e-9,
+        ..Default::default()
+    };
+
+    let result = spice21::analysis::tran(ckt, None, Some(opts)).ok()?;
+
+    // Read initial well voltage and final output voltage
+    let v_initial = result
+        .map
+        .get("well0")
+        .and_then(|v| v.first().copied())
+        .unwrap_or(0.0);
+
+    let v_out = result
+        .map
+        .get("sr_out")
+        .and_then(|v| v.last().copied())
+        .unwrap_or(0.0);
+
+    if v_initial.abs() < 1e-15 {
+        return None;
+    }
+
+    // CTE per stage = (v_out / v_initial)^(1/n_stages)
+    let ratio = (v_out / v_initial).abs().clamp(0.0, 1.0);
+    let cte_per_stage = ratio.powf(1.0 / n_stages as f64);
+
+    Some(cte_per_stage.clamp(0.99, 1.0))
+}
+
+fn analytical_cte(n_stages: usize, params: &SpiceParams) -> f64 {
+    let base_cte = 0.999999;
+    let freq_factor = 1.0 - (params.clock_freq_mhz / 100.0).min(0.5) * 0.00001;
+    let vdd_factor = (params.effective_vdd() / 15.0).min(1.0);
+    let stage_factor = 1.0 - (n_stages as f64 / 100.0) * 0.000001;
+
+    let clock_period_ns = 1e3 / params.clock_freq_mhz;
+    let overlap_fraction = if params.phase_overlap_ns > 0.0 {
+        (params.phase_overlap_ns / clock_period_ns).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let overlap_factor = 1.0 - overlap_fraction * 0.0001;
+    let missing_factor = 1.0 - params.missing_pulse_rate * 0.001;
+
+    base_cte * freq_factor * vdd_factor * stage_factor * overlap_factor * missing_factor
+}

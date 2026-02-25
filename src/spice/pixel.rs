@@ -65,3 +65,24 @@ pub fn charge_to_fd_voltage(charge_electrons: f64) -> f64 {
     let q = 1.6e-19;
     charge_electrons * q / c_fd
 }
+
+/// Compute the pixel transfer curve: charge (electrons) → FD signal voltage.
+///
+/// Uses the analytical Q/C model directly, since the pixel circuit JSON
+/// cannot encode initial charge state (spice21 doesn't support IC on caps).
+/// Returns signal voltage V = Q * e / C_fd (0 at zero charge, ~0.64V at full well).
+/// Returns (transfer_curve, analytical_fallback).
+pub fn run_pixel_simulation(
+    _params: &SpiceParams,
+    full_well: f64,
+    n_points: usize,
+) -> (Vec<(f64, f64)>, bool) {
+    log::info!("Pixel transfer: using analytical Q/C model ({} points)", n_points);
+    let curve = (0..n_points)
+        .map(|i| {
+            let charge = full_well * i as f64 / (n_points - 1).max(1) as f64;
+            (charge, charge_to_fd_voltage(charge))
+        })
+        .collect();
+    (curve, true) // Always analytical (spice21 can't encode initial charge on caps)
+}

@@ -9,5 +9,4 @@ pub mod glitch;
 pub mod image_io;
 pub mod pipeline;
 
-#[cfg(feature = "spice")]
 pub mod spice;

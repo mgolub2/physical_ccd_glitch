@@ -90,7 +90,6 @@ pub struct PipelineParams {
     pub contrast: f64,
 
     // SPICE simulation
-    #[cfg(feature = "spice")]
     pub spice: crate::spice::SpiceParams,
 }
 
@@ -161,7 +160,6 @@ impl Default for PipelineParams {
             brightness: 0.0,
             contrast: 1.0,
 
-            #[cfg(feature = "spice")]
             spice: crate::spice::SpiceParams::default(),
         }
     }
@@ -172,7 +170,7 @@ impl Default for PipelineParams {
 pub fn process(
     source: &image::DynamicImage,
     params: &PipelineParams,
-    #[cfg(feature = "spice")] spice_cache: &Option<crate::spice::SpiceCache>,
+    spice_cache: &Option<crate::spice::SpiceCache>,
 ) -> (usize, usize, Vec<u8>) {
     let w = params.sensor_width;
     let h = params.sensor_height;
@@ -196,7 +194,6 @@ pub fn process(
     sensor::add_read_noise(&mut mosaic, params.read_noise);
 
     // SPICE branch: replace mathematical pipeline stages with circuit-derived processing
-    #[cfg(feature = "spice")]
     let spice_handled = process_spice_branch(
         &mut mosaic,
         width,
@@ -204,9 +201,6 @@ pub fn process(
         params,
         spice_cache,
     );
-
-    #[cfg(not(feature = "spice"))]
-    let spice_handled = false;
 
     if !spice_handled {
         // Step 4: Blooming
@@ -350,7 +344,6 @@ pub fn process(
 ///
 /// Returns true if SPICE processing was applied (replacing math pipeline stages),
 /// false if SPICE mode is Off or no cache is available.
-#[cfg(feature = "spice")]
 fn process_spice_branch(
     mosaic: &mut [f64],
     width: usize,
@@ -373,10 +366,8 @@ fn process_spice_branch(
         SpiceMode::Off => false,
 
         SpiceMode::FullReadout => {
-            // Replace blooming + v-clock + h-clock + amplifier + ADC
-            // with SPICE-derived transfer function + timing artifacts
+            // Full SPICE-driven pipeline: missing pulses -> CTE -> transfer -> CDS noise -> ADC -> ringing
 
-            // Apply missing-pulse row artifacts before other processing
             transfer_function::apply_missing_pulses(
                 mosaic,
                 width,
@@ -384,30 +375,31 @@ fn process_spice_branch(
                 params.spice.missing_pulse_rate,
             );
 
-            // Apply transfer function (replaces amplifier nonlinearity + gain)
+            // CTE degradation using SPICE-derived CTE
+            apply_spice_cte(mosaic, width, height, cache.effective_cte, params);
+
+            // Transfer function (composed pixel -> amp curve)
             transfer_function::apply_transfer_function(
                 mosaic,
                 &cache.transfer_curve,
                 params.full_well,
             );
 
-            // Apply ringing (replaces h_ringing)
-            transfer_function::apply_ringing(mosaic, width, height, &cache.ringing_kernel);
+            // CDS residual noise
+            apply_spice_cds_noise(mosaic, cache.cds_rejection, cache.noise_sigma);
 
-            // Quantize to bit depth (simple version replacing full ADC)
-            let max_code = ((1u64 << params.bit_depth) - 1) as f64;
-            for val in mosaic.iter_mut() {
-                let normalized = (*val / params.full_well).clamp(0.0, 1.0);
-                *val = (normalized * max_code).round();
-            }
+            // ADC quantization using SPICE-derived transfer
+            apply_spice_adc(mosaic, &cache.adc_transfer, &cache.adc_dnl, params);
+
+            // Ringing from clock driver
+            transfer_function::apply_ringing(mosaic, width, height, &cache.ringing_kernel);
 
             true
         }
 
         SpiceMode::AmplifierOnly => {
-            // Keep existing blooming + transfer, replace amp + ADC with SPICE
+            // Math blooming + transfer, then SPICE amp + ADC
 
-            // Apply missing-pulse row artifacts before other processing
             transfer_function::apply_missing_pulses(
                 mosaic,
                 width,
@@ -415,7 +407,6 @@ fn process_spice_branch(
                 params.spice.missing_pulse_rate,
             );
 
-            // Run mathematical blooming and transfer first
             crate::ccd::blooming::apply_blooming(
                 mosaic,
                 width,
@@ -444,27 +435,22 @@ fn process_spice_branch(
                 params.readout_direction,
             );
 
-            // Replace amp + ADC with SPICE transfer function
+            // SPICE amp transfer + ADC
             transfer_function::apply_transfer_function(
                 mosaic,
                 &cache.transfer_curve,
                 params.full_well,
             );
 
-            let max_code = ((1u64 << params.bit_depth) - 1) as f64;
-            for val in mosaic.iter_mut() {
-                let normalized = (*val / params.full_well).clamp(0.0, 1.0);
-                *val = (normalized * max_code).round();
-            }
+            apply_spice_cds_noise(mosaic, cache.cds_rejection, cache.noise_sigma);
+            apply_spice_adc(mosaic, &cache.adc_transfer, &cache.adc_dnl, params);
 
             true
         }
 
         SpiceMode::TransferCurveOnly => {
-            // Run the full mathematical pipeline except apply SPICE transfer curve
-            // instead of the mathematical amplifier nonlinearity
+            // Full math pipeline but SPICE amp transfer curve for nonlinearity
 
-            // Apply missing-pulse row artifacts before other processing
             transfer_function::apply_missing_pulses(
                 mosaic,
                 width,
@@ -525,4 +511,132 @@ fn process_spice_branch(
             true
         }
     }
+}
+
+/// Apply CTE degradation using SPICE-derived CTE value.
+///
+/// Simulates vertical and horizontal charge trailing.
+fn apply_spice_cte(
+    mosaic: &mut [f64],
+    width: usize,
+    height: usize,
+    cte: f64,
+    params: &PipelineParams,
+) {
+    if cte >= 1.0 {
+        return;
+    }
+
+    let loss = 1.0 - cte;
+
+    // Vertical (parallel) CTE trailing
+    for x in 0..width {
+        let mut trail = 0.0;
+        for y in 0..height {
+            let idx = y * width + x;
+            let lost = mosaic[idx] * loss;
+            mosaic[idx] -= lost;
+            mosaic[idx] += trail;
+            trail = lost;
+        }
+    }
+
+    // Horizontal (serial) CTE trailing
+    for y in 0..height {
+        let row_start = y * width;
+        let mut trail = 0.0;
+        let range: Box<dyn Iterator<Item = usize>> =
+            match params.readout_direction {
+                crate::ccd::transfer::ReadoutDirection::LeftToRight
+                | crate::ccd::transfer::ReadoutDirection::Alternating => {
+                    Box::new(0..width)
+                }
+                crate::ccd::transfer::ReadoutDirection::RightToLeft => {
+                    Box::new((0..width).rev())
+                }
+            };
+        for x in range {
+            let idx = row_start + x;
+            let lost = mosaic[idx] * loss;
+            mosaic[idx] -= lost;
+            mosaic[idx] += trail;
+            trail = lost;
+        }
+    }
+}
+
+/// Apply CDS residual noise: Gaussian noise scaled by (1 - rejection).
+fn apply_spice_cds_noise(mosaic: &mut [f64], rejection: f64, noise_sigma: f64) {
+    let effective_noise = noise_sigma * (1.0 - rejection).max(0.0);
+    if effective_noise < 0.01 {
+        return;
+    }
+
+    // Simple deterministic noise based on index (reproducible)
+    for (i, val) in mosaic.iter_mut().enumerate() {
+        let hash = ((i as f64 * 0.6180339887).fract() * 2.0 - 1.0) * 2.0;
+        *val += hash * effective_noise;
+    }
+}
+
+/// Apply SPICE-derived ADC quantization.
+///
+/// Uses the 4-bit SPICE transfer function scaled to target bit depth,
+/// with DNL applied.
+fn apply_spice_adc(
+    mosaic: &mut [f64],
+    adc_transfer: &[(f64, u16)],
+    adc_dnl: &[f64],
+    params: &PipelineParams,
+) {
+    let max_code = ((1u64 << params.bit_depth) - 1) as f64;
+    let full_well = params.full_well;
+
+    if adc_transfer.is_empty() {
+        // Simple quantization fallback
+        for val in mosaic.iter_mut() {
+            let normalized = (*val / full_well).clamp(0.0, 1.0);
+            *val = (normalized * max_code).round();
+        }
+        return;
+    }
+
+    // ADC transfer is 4-bit (0..15). Scale to target bit depth.
+    let adc_max_code = adc_transfer.iter().map(|(_, c)| *c).max().unwrap_or(15) as f64;
+    let v_max = adc_transfer.last().map(|(v, _)| *v).unwrap_or(1.0);
+
+    for val in mosaic.iter_mut() {
+        let normalized = (*val / full_well).clamp(0.0, 1.0);
+        let v_equiv = normalized * v_max;
+
+        // Look up in ADC transfer function
+        let adc_code = lookup_adc_transfer(adc_transfer, v_equiv);
+
+        // Scale from 4-bit to target bit depth
+        let scaled = (adc_code as f64 / adc_max_code) * max_code;
+
+        // Apply DNL
+        let code_idx = (adc_code as usize).min(adc_dnl.len().saturating_sub(1));
+        let dnl_offset = if !adc_dnl.is_empty() {
+            adc_dnl[code_idx] * (max_code / adc_max_code)
+        } else {
+            0.0
+        };
+
+        *val = (scaled + dnl_offset).round().clamp(0.0, max_code);
+    }
+}
+
+/// Look up output code from ADC transfer function via interpolation.
+fn lookup_adc_transfer(transfer: &[(f64, u16)], v_in: f64) -> u16 {
+    if transfer.is_empty() {
+        return 0;
+    }
+
+    for i in (0..transfer.len()).rev() {
+        if v_in >= transfer[i].0 {
+            return transfer[i].1;
+        }
+    }
+    transfer[0].1
 }

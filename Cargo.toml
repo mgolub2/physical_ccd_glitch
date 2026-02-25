@@ -3,10 +3,6 @@ name = "physical_ccd_glitch"
 version = "0.1.0"
 edition = "2024"
 
-[features]
-default = ["spice"]
-spice = ["dep:spice21"]
-
 [dependencies]
 eframe = "0.31"
 egui_extras = { version = "0.31", features = ["image"] }
@@ -15,7 +11,7 @@ rand = "0.9"
 rand_distr = "0.5"
 log = "0.4"
 web-time = "1"
-spice21 = { git = "https://github.com/dan-fritchman/Spice21.git", optional = true }
+spice21 = { git = "https://github.com/dan-fritchman/Spice21.git" }
 
 # native only
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
@@ -49,7 +45,6 @@ getrandom = { version = "0.3", features = ["wasm_js"] }
 [[bin]]
 name = "spice_test"
 path = "src/bin/spice_test.rs"
-required-features = ["spice"]
 
 [profile.release]
 opt-level = 2

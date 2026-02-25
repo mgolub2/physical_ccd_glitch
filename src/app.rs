@@ -21,7 +21,6 @@ pub struct CcdGlitchApp {
     processing_time_ms: f64,
     #[cfg(target_arch = "wasm32")]
     pending_file: std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>>,
-    #[cfg(feature = "spice")]
     spice_cache: Option<crate::spice::SpiceCache>,
 }
 
@@ -48,7 +47,6 @@ impl CcdGlitchApp {
             processing_time_ms: 0.0,
             #[cfg(target_arch = "wasm32")]
             pending_file: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            #[cfg(feature = "spice")]
             spice_cache: None,
         }
     }
@@ -157,7 +155,6 @@ impl CcdGlitchApp {
                 let (w, h, bytes) = pipeline::process(
                     source,
                     &self.params,
-                    #[cfg(feature = "spice")]
                     &self.spice_cache,
                 );
                 let img = image::RgbImage::from_raw(w as u32, h as u32, bytes)
@@ -178,7 +175,6 @@ impl CcdGlitchApp {
             let (w, h, bytes) = pipeline::process(
                 source,
                 &self.params,
-                #[cfg(feature = "spice")]
                 &self.spice_cache,
             );
             if let Some(img) = image::RgbImage::from_raw(w as u32, h as u32, bytes) {
@@ -193,7 +189,6 @@ impl CcdGlitchApp {
     fn process_image(&mut self, ctx: &egui::Context) {
         if let Some(source) = &self.source_image {
             // Run SPICE simulation if needed
-            #[cfg(feature = "spice")]
             {
                 use crate::spice::SpiceMode;
                 if self.params.spice.mode != SpiceMode::Off {
@@ -209,7 +204,6 @@ impl CcdGlitchApp {
             let (w, h, bytes) = pipeline::process(
                 source,
                 &self.params,
-                #[cfg(feature = "spice")]
                 &self.spice_cache,
             );
             self.processing_time_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -391,7 +385,7 @@ impl eframe::App for CcdGlitchApp {
                     )
                     .default_open(true)
                     .show(ui, |ui| {
-                        crate::circuit_display::draw_circuit(ui, &self.params);
+                        crate::circuit_display::draw_circuit(ui, &self.params, &self.spice_cache);
                     });
 
                     // Waveform display
@@ -400,18 +394,11 @@ impl eframe::App for CcdGlitchApp {
                     )
                     .default_open(true)
                     .show(ui, |ui| {
-                        #[cfg(feature = "spice")]
-                        {
-                            crate::waveform_display::draw_waveforms_with_spice(
-                                ui,
-                                &self.params,
-                                &self.spice_cache,
-                            );
-                        }
-                        #[cfg(not(feature = "spice"))]
-                        {
-                            crate::waveform_display::draw_waveforms(ui, &self.params);
-                        }
+                        crate::waveform_display::draw_waveforms_with_spice(
+                            ui,
+                            &self.params,
+                            &self.spice_cache,
+                        );
                     });
 
                     ui.separator();
@@ -419,7 +406,6 @@ impl eframe::App for CcdGlitchApp {
                     let mut changed = false;
                     changed |= ui_sensor_config(ui, &mut self.params, self.sensor_preset);
 
-                    #[cfg(feature = "spice")]
                     {
                         let (spice_changed, force_sim) = ui_spice_mode(ui, &mut self.params, &self.spice_cache);
                         changed |= spice_changed;
@@ -817,7 +803,6 @@ fn ui_channel(ui: &mut egui::Ui, params: &mut PipelineParams) -> bool {
     changed
 }
 
-#[cfg(feature = "spice")]
 fn ui_spice_mode(
     ui: &mut egui::Ui,
     params: &mut PipelineParams,

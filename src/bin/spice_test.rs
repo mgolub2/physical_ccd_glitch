@@ -13,6 +13,7 @@ use image::{DynamicImage, Rgb, RgbImage};
 use std::path::Path;
 
 fn main() {
+    #[cfg(not(target_arch = "wasm32"))]
     env_logger::init();
 
     let output_dir = Path::new("test_output");
@@ -216,10 +217,19 @@ fn process_with_spice(
 
     let (w, h, bytes) = pipeline::process(img, &params, &cache);
     let cache_out = cache.unwrap_or(SpiceCache {
+        pixel_transfer: vec![],
+        effective_cte: 1.0,
+        clock_ringing_kernel: vec![],
+        clock_waveforms: [vec![], vec![], vec![]],
+        amp_transfer_curve: vec![],
+        amp_noise_sigma: 0.0,
+        cds_rejection: 0.0,
+        adc_transfer: vec![],
+        adc_dnl: vec![],
         transfer_curve: vec![],
         ringing_kernel: vec![],
         noise_sigma: 0.0,
-        effective_cte: 1.0,
+        fallbacks: Default::default(),
         params_hash: 0,
         sim_time_ms: 0.0,
     });

@@ -24,10 +24,9 @@ const TEST_PIXELS: [f32; NUM_PIXELS] = [
     0.10, 0.95, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10,
 ];
 
-#[cfg(feature = "spice")]
 const TRACE_SPICE: egui::Color32 = egui::Color32::from_rgb(255, 80, 40);
 
-#[cfg_attr(feature = "spice", allow(dead_code))]
+#[allow(dead_code)]
 pub fn draw_waveforms(ui: &mut egui::Ui, params: &PipelineParams) {
     draw_clock_panel(ui, params);
     ui.add_space(2.0);
@@ -35,7 +34,6 @@ pub fn draw_waveforms(ui: &mut egui::Ui, params: &PipelineParams) {
 }
 
 /// Draw waveforms with optional SPICE overlay.
-#[cfg(feature = "spice")]
 pub fn draw_waveforms_with_spice(
     ui: &mut egui::Ui,
     params: &PipelineParams,
@@ -47,7 +45,6 @@ pub fn draw_waveforms_with_spice(
 }
 
 /// Video output panel with SPICE transfer curve overlay.
-#[cfg(feature = "spice")]
 fn draw_video_panel_with_spice(
     ui: &mut egui::Ui,
     params: &PipelineParams,
@@ -117,7 +114,6 @@ fn draw_video_panel_with_spice(
 }
 
 /// Generate a video signal using the SPICE transfer curve applied to test pixels.
-#[cfg(feature = "spice")]
 fn generate_spice_video_signal(
     params: &PipelineParams,
     transfer_curve: &[(f64, f64)],
@@ -248,7 +244,7 @@ fn draw_clock_panel(ui: &mut egui::Ui, params: &PipelineParams) {
 
 // --- Video output (analog + ADC) ---
 
-#[cfg_attr(feature = "spice", allow(dead_code))]
+#[allow(dead_code)]
 fn draw_video_panel(ui: &mut egui::Ui, params: &PipelineParams) {
     let width = ui.available_width();
     let height = 80.0;
