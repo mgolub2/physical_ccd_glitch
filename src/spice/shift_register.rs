@@ -105,43 +105,102 @@ pub fn run_shift_register_simulation(params: &SpiceParams) -> (f64, bool) {
     }
 }
 
+/// Build a small 3-stage circuit for IC-based charge transfer simulation.
+///
+/// Uses initial conditions to pre-charge well0, with phi1 gate open (VDD)
+/// so charge transfers from well0 → well1 through the MOSFET.
+/// Only 3 MOSFETs + 4 capacitors — well within spice21's convergence limits.
+fn build_ic_transfer_json(params: &SpiceParams) -> String {
+    let vdd = params.effective_vdd();
+    let c_well = 30e-15; // 30 fF per well
+
+    let signals = ["vdd", "phi1", "well0", "well1", "well2", "sr_out"];
+
+    let comps = format!(
+        r#"[
+            {{"type": "V", "name": "v_vdd", "p": "vdd", "n": "", "dc": {vdd}, "acm": 0.0}},
+            {{"type": "V", "name": "v_phi1", "p": "phi1", "n": "", "dc": {vdd}, "acm": 0.0}},
+            {{"type": "C", "name": "c_well0", "p": "well0", "n": "", "c": {c}}},
+            {{"type": "C", "name": "c_well1", "p": "well1", "n": "", "c": {c}}},
+            {{"type": "C", "name": "c_well2", "p": "well2", "n": "", "c": {c}}},
+            {{"type": "C", "name": "c_out", "p": "sr_out", "n": "", "c": {c}}},
+            {{"type": "M", "name": "m_sr0", "model": "nmos_tg", "params": "tg_9u_05u",
+              "ports": {{"g": "phi1", "d": "well1", "s": "well0", "b": ""}}}},
+            {{"type": "M", "name": "m_sr1", "model": "nmos_tg", "params": "tg_9u_05u",
+              "ports": {{"g": "phi1", "d": "well2", "s": "well1", "b": ""}}}},
+            {{"type": "M", "name": "m_sr2", "model": "nmos_tg", "params": "tg_9u_05u",
+              "ports": {{"g": "phi1", "d": "sr_out", "s": "well2", "b": ""}}}}
+        ]"#,
+        vdd = vdd,
+        c = c_well,
+    );
+
+    super::models::build_circuit_json("sr_ic_transfer", &signals, &comps)
+}
+
 fn try_shift_register_simulation(params: &SpiceParams) -> Option<f64> {
-    use spice21::circuit::Ckt;
+    use spice21::circuit::{Ckt, NodeRef};
 
-    let n_stages = params.shift_register_stages.clamp(2, 16);
-    let json = build_shift_register_json(n_stages, params);
+    let vdd = params.effective_vdd();
+    let v_test = vdd * 0.5; // Pre-charge well0 to half VDD
+    let n_stages_actual = params.shift_register_stages.clamp(2, 16);
 
+    let json = build_ic_transfer_json(params);
     let ckt = Ckt::from_json(&json).ok()?;
+
+    // Use initial conditions to pre-charge well0
     let opts = spice21::analysis::TranOptions {
         tstep: 1e-10,
-        tstop: 500e-9,
-        ..Default::default()
+        tstop: 200e-9,
+        ic: vec![(NodeRef::Name("well0".into()), v_test)],
     };
 
     let result = spice21::analysis::tran(ckt, None, Some(opts)).ok()?;
 
-    // Read initial well voltage and final output voltage
-    let v_initial = result
+    // Read final voltages from well0 and well1
+    let v_well0_final = result
         .map
         .get("well0")
-        .and_then(|v| v.first().copied())
-        .unwrap_or(0.0);
-
-    let v_out = result
-        .map
-        .get("sr_out")
         .and_then(|v| v.last().copied())
         .unwrap_or(0.0);
 
-    if v_initial.abs() < 1e-15 {
+    let v_well1_final = result
+        .map
+        .get("well1")
+        .and_then(|v| v.last().copied())
+        .unwrap_or(0.0);
+
+    // Charge transferred through one gate = V_well1 / V_initial
+    // (for equal capacitances, voltage ratio = charge ratio)
+    if v_test.abs() < 1e-15 {
         return None;
     }
 
-    // CTE per stage = (v_out / v_initial)^(1/n_stages)
-    let ratio = (v_out / v_initial).abs().clamp(0.0, 1.0);
-    let cte_per_stage = ratio.powf(1.0 / n_stages as f64);
+    // Single-gate CTE: fraction of charge that made it through one transfer gate
+    let single_gate_cte = (v_well1_final / v_test).abs().clamp(0.0, 1.0);
 
-    Some(cte_per_stage.clamp(0.99, 1.0))
+    // Sanity check: well0 should have lost charge, well1 should have gained some
+    if v_well1_final < 1e-6 && v_well0_final > v_test * 0.99 {
+        // No charge transferred at all — simulation didn't work
+        return None;
+    }
+
+    // Apply glitch parameter corrections
+    let clock_period_ns = 1e3 / params.clock_freq_mhz;
+    let freq_correction = 1.0 - (params.clock_freq_mhz / 100.0).min(0.5) * 0.00001;
+    let overlap_fraction = if params.phase_overlap_ns > 0.0 {
+        (params.phase_overlap_ns / clock_period_ns).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let overlap_correction = 1.0 - overlap_fraction * 0.0001;
+    let missing_correction = 1.0 - params.missing_pulse_rate * 0.001;
+    let stage_correction = 1.0 - (n_stages_actual as f64 / 100.0) * 0.000001;
+
+    let cte = single_gate_cte * freq_correction * overlap_correction
+        * missing_correction * stage_correction;
+
+    Some(cte.clamp(0.99, 1.0))
 }
 
 fn analytical_cte(n_stages: usize, params: &SpiceParams) -> f64 {
