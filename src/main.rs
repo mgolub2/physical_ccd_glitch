@@ -31,6 +31,7 @@ fn main() -> eframe::Result {
 fn main() {
     use wasm_bindgen::JsCast;
 
+    console_error_panic_hook::set_once();
     eframe::WebLogger::init(log::LevelFilter::Debug).ok();
 
     let web_options = eframe::WebOptions::default();
