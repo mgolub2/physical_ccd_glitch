@@ -25,6 +25,9 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
 
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v3
+
       - name: Install Trunk
         run: cargo install trunk
 
